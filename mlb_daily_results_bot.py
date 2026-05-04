@@ -722,6 +722,7 @@ class Config:
     auto_lookback_days: int
     team_emoji: str
     dry_run: bool
+    delete_webhook_on_start: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -741,6 +742,7 @@ class Config:
             auto_lookback_days=env_int("AUTO_LOOKBACK_DAYS", 2),
             team_emoji=env_str("TEAM_EMOJI", "😀") or "😀",
             dry_run=env_bool("DRY_RUN", False),
+            delete_webhook_on_start=env_bool("DELETE_WEBHOOK_ON_START", True),
         )
 
 
@@ -1054,6 +1056,9 @@ class Telegram:
         data = self.request("getUpdates", payload)
         return list(data.get("result") or [])
 
+    def delete_webhook(self) -> None:
+        self.request("deleteWebhook", {"drop_pending_updates": False})
+
 
 class BotApp:
     def __init__(self, config: Config, store: Store, client: MlbClient, formatter: Formatter, telegram: Telegram):
@@ -1117,6 +1122,8 @@ class BotApp:
     def run_polling(self) -> None:
         if not self.cfg.token and not self.cfg.dry_run:
             raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+        if self.cfg.delete_webhook_on_start:
+            self.telegram.delete_webhook()
         offset_raw = self.store.get_meta("telegram_offset", "")
         offset = int(offset_raw) if offset_raw.isdigit() else None
         print("MLB daily results bot started", flush=True)

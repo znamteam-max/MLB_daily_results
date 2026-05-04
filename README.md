@@ -19,6 +19,9 @@ pip install -r requirements.txt
 python mlb_daily_results_bot.py
 ```
 
+При запуске long polling бот по умолчанию снимает старый Telegram webhook
+(`DELETE_WEBHOOK_ON_START=true`), иначе Telegram может не отдавать апдейты.
+
 ## Команды
 
 `/today [YYYY-MM-DD]` - показать пост результатов.
