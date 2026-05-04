@@ -51,11 +51,55 @@ python mlb_daily_results_bot.py
 он публикует пост. Повторной публикации за ту же дату не будет: `message_id`
 сохраняется в SQLite.
 
-## Деплой
+## Деплой: постоянный worker
 
 Проект можно запускать как постоянный worker-процесс. Для PaaS есть `Procfile`,
 для контейнера - `Dockerfile`. Важно сохранить `state/` между перезапусками,
 иначе бот не будет помнить уже опубликованные `message_id` и словарь правок.
+
+## Деплой: Vercel + cron-jobs.org
+
+Vercel не запускает бесконечный polling-процесс. Для Vercel используются HTTP
+functions:
+
+`/api/telegram` - Telegram webhook для команд.
+
+`/api/cron?secret=...` - проверка результатов и автопостинг.
+
+`/api/health` - быстрая проверка переменных окружения.
+
+На Vercel нужно добавить переменные:
+
+```env
+TELEGRAM_BOT_TOKEN=...
+TARGET_CHAT_ID=-1003643946438
+CRON_SECRET=длинная_случайная_строка
+KV_URL=...
+FAST_PITCHER_RECORDS=true
+```
+
+`KV_URL` или `REDIS_URL` обязателен на Vercel: файловая система serverless
+функций не хранит SQLite между вызовами. Подойдёт Vercel KV / Upstash Redis.
+`FAST_PITCHER_RECORDS=true` берёт рекорды питчеров пачкой и держит cron-функцию
+короткой для serverless-лимитов.
+
+После деплоя задайте Telegram webhook:
+
+```text
+https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<your-project>.vercel.app/api/telegram
+```
+
+В cron-jobs.org создайте задачу каждую минуту:
+
+```text
+https://<your-project>.vercel.app/api/cron?secret=<CRON_SECRET>
+```
+
+Для ручной проверки конкретной даты:
+
+```text
+https://<your-project>.vercel.app/api/cron?secret=<CRON_SECRET>&date=2026-05-03
+```
 
 Для проверки без Telegram:
 

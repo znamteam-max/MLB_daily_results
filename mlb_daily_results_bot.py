@@ -19,6 +19,11 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+try:
+    import redis
+except Exception:  # pragma: no cover - optional runtime dependency for Vercel KV/Redis
+    redis = None
+
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -465,6 +470,113 @@ class Store:
         self.conn.commit()
 
 
+class RedisStore:
+    def __init__(self, url: str):
+        if redis is None:
+            raise RuntimeError("redis package is required for KV_URL/REDIS_URL storage")
+        self.client = redis.Redis.from_url(url, decode_responses=True)
+        self.client.ping()
+
+    @staticmethod
+    def translation_key(kind: str, source: str) -> str:
+        return f"mlb:translations:{kind}:{norm_key(source)}"
+
+    @staticmethod
+    def post_key(game_date: date | str) -> str:
+        raw = game_date.isoformat() if isinstance(game_date, date) else str(game_date)
+        return f"mlb:posts:{raw}"
+
+    @staticmethod
+    def meta_key(key: str) -> str:
+        return f"mlb:meta:{key}"
+
+    def close(self) -> None:
+        self.client.close()
+
+    def get_meta(self, key: str, default: str = "") -> str:
+        value = self.client.get(self.meta_key(key))
+        return str(value) if value is not None else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.client.set(self.meta_key(key), value)
+
+    def put_translation(self, kind: str, source: str, target: str) -> None:
+        payload = {
+            "kind": kind,
+            "source": source.strip(),
+            "source_norm": norm_key(source),
+            "target": target.strip(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        key = self.translation_key(kind, source)
+        pipe = self.client.pipeline()
+        pipe.set(key, json.dumps(payload, ensure_ascii=False))
+        pipe.zadd("mlb:translations:index", {key: time.time()})
+        pipe.execute()
+
+    def get_translation(self, kind: str, source: str) -> str | None:
+        keys = [kind]
+        if kind != "any":
+            keys.append("any")
+        for k in keys:
+            raw = self.client.get(self.translation_key(k, source))
+            if raw:
+                return str(json.loads(raw)["target"])
+        return None
+
+    def list_translations(self, query: str = "", limit: int = 30) -> list[dict[str, str]]:
+        keys = self.client.zrevrange("mlb:translations:index", 0, max(limit * 5, limit))
+        rows: list[dict[str, str]] = []
+        q_norm = norm_key(query)
+        q_lower = query.casefold()
+        for key in keys:
+            raw = self.client.get(key)
+            if not raw:
+                continue
+            row = json.loads(raw)
+            if query and q_norm not in row.get("source_norm", "") and q_lower not in row.get("target", "").casefold():
+                continue
+            rows.append(row)
+            if len(rows) >= limit:
+                break
+        return rows
+
+    def save_post(self, game_date: date, chat_id: int | str, message_id: int, text: str) -> None:
+        existing = self.get_post(game_date)
+        now = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "game_date": game_date.isoformat(),
+            "chat_id": str(chat_id),
+            "message_id": int(message_id),
+            "text": text,
+            "posted_at": existing["posted_at"] if existing else now,
+            "updated_at": now,
+        }
+        score = int(game_date.strftime("%Y%m%d"))
+        pipe = self.client.pipeline()
+        pipe.set(self.post_key(game_date), json.dumps(payload, ensure_ascii=False))
+        pipe.zadd("mlb:posts:index", {game_date.isoformat(): score})
+        pipe.execute()
+
+    def get_post(self, game_date: date) -> dict[str, Any] | None:
+        raw = self.client.get(self.post_key(game_date))
+        return json.loads(raw) if raw else None
+
+    def latest_post(self) -> dict[str, Any] | None:
+        dates = self.client.zrevrange("mlb:posts:index", 0, 0)
+        if not dates:
+            return None
+        return self.get_post(date.fromisoformat(str(dates[0])))
+
+    def update_post_text(self, game_date: date, text: str) -> None:
+        post = self.get_post(game_date)
+        if not post:
+            return
+        post["text"] = text
+        post["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.client.set(self.post_key(game_date), json.dumps(post, ensure_ascii=False))
+
+
 class MlbClient:
     def __init__(self):
         self.session = requests.Session()
@@ -475,6 +587,7 @@ class MlbClient:
             }
         )
         self._pitcher_logs: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        self._season_pitching_records: dict[tuple[int, int], tuple[int, int, int]] = {}
 
     def get_json(self, url: str, tries: int = 3, timeout: int = 30) -> Any:
         last_error: Exception | None = None
@@ -515,7 +628,38 @@ class MlbClient:
         self._pitcher_logs[key] = splits
         return splits
 
+    def preload_pitcher_season_records(self, player_ids: Iterable[int], season: int) -> None:
+        ids = sorted({int_or_zero(player_id) for player_id in player_ids if int_or_zero(player_id)})
+        missing = [player_id for player_id in ids if (player_id, season) not in self._season_pitching_records]
+        if not missing:
+            return
+        for chunk in chunked(missing, 40):
+            joined = ",".join(str(player_id) for player_id in chunk)
+            url = (
+                f"{MLB_API}/people?personIds={joined}"
+                f"&hydrate=stats(group=[pitching],type=[season],season={season})"
+            )
+            data = self.get_json(url)
+            for person in data.get("people") or []:
+                player_id = int_or_zero(person.get("id"))
+                stat = None
+                for group in person.get("stats") or []:
+                    splits = group.get("splits") or []
+                    if splits:
+                        stat = splits[0].get("stat") or {}
+                        break
+                if stat is None:
+                    continue
+                self._season_pitching_records[(player_id, season)] = (
+                    int_or_zero(stat.get("wins")),
+                    int_or_zero(stat.get("losses")),
+                    int_or_zero(stat.get("saves")),
+                )
+
     def pitcher_record_through(self, player_id: int, season: int, through_date: date) -> tuple[int, int, int] | None:
+        cached = self._season_pitching_records.get((player_id, season))
+        if cached:
+            return cached
         try:
             splits = self.pitcher_game_log(player_id, season)
         except Exception:
@@ -723,6 +867,7 @@ class Config:
     team_emoji: str
     dry_run: bool
     delete_webhook_on_start: bool
+    fast_pitcher_records: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -743,6 +888,7 @@ class Config:
             team_emoji=env_str("TEAM_EMOJI", "😀") or "😀",
             dry_run=env_bool("DRY_RUN", False),
             delete_webhook_on_start=env_bool("DELETE_WEBHOOK_ON_START", True),
+            fast_pitcher_records=env_bool("FAST_PITCHER_RECORDS", True),
         )
 
 
@@ -757,6 +903,8 @@ class Formatter:
         header = f"⚾️ МЛБ • {self.series_title(games)} • {ru_date(d)}"
         if not games:
             return f"{header}\n\nМатчей нет."
+        if self.cfg.fast_pitcher_records:
+            self.preload_decision_pitchers(games, d)
 
         blocks = [header]
         for game in sorted(games, key=self.game_sort_key):
@@ -782,6 +930,19 @@ class Formatter:
             suffix = state if state else start
             lines.append(f"{home} — {away} • {suffix}")
         return "\n".join(lines).strip()
+
+    def preload_decision_pitchers(self, games: list[dict[str, Any]], d: date) -> None:
+        player_ids: set[int] = set()
+        season = d.year
+        for game in games:
+            season = int_or_zero(game.get("season")) or season
+            decisions = game.get("decisions") or {}
+            for key in ("winner", "loser", "save"):
+                player_id = int_or_zero((decisions.get(key) or {}).get("id"))
+                if player_id:
+                    player_ids.add(player_id)
+        if player_ids:
+            self.client.preload_pitcher_season_records(player_ids, season)
 
     def status_summary(self, d: date, posted: bool) -> str:
         games = self.client.games(d)
@@ -1103,21 +1264,32 @@ class BotApp:
         if now < self.next_auto_check:
             return
         self.next_auto_check = now + max(30, self.cfg.auto_check_seconds)
+        for line in self.cron_check_once():
+            print(f"[auto] {line}", flush=True)
 
+    def cron_check_once(self) -> list[str]:
+        if not self.cfg.auto_post:
+            return ["AUTO_POST=false"]
+        results: list[str] = []
         today = datetime.now(self.cfg.mlb_tz).date()
         for delta in range(self.cfg.auto_lookback_days):
             d = today - timedelta(days=delta)
             if self.store.get_post(d):
+                results.append(f"{d.isoformat()}: already posted")
                 continue
             try:
                 games = self.client.games(d)
                 if not self.formatter.all_done(games):
+                    final = sum(1 for game in games if self.formatter.is_final_game(game))
+                    results.append(f"{d.isoformat()}: not ready ({final}/{len(games)} final)")
                     continue
                 text = self.formatter.build_results(d, include_pending=False)
                 result = self.send_or_edit_channel_post(d, text)
-                print(f"[auto] {result}", flush=True)
+                results.append(result)
             except Exception as exc:
-                print(f"[auto] failed for {d.isoformat()}: {exc}", flush=True)
+                results.append(f"{d.isoformat()}: failed: {exc}")
+        return results
+
 
     def run_polling(self) -> None:
         if not self.cfg.token and not self.cfg.dry_run:
@@ -1284,10 +1456,18 @@ def plural_ru(n: int, one: str, few: str, many: str) -> str:
     return many
 
 
+def chunked(items: list[int], size: int) -> Iterable[list[int]]:
+    for idx in range(0, len(items), size):
+        yield items[idx : idx + size]
+
+
 def make_app() -> BotApp:
     load_dotenv()
     config = Config.from_env()
-    store = Store(config.state_db)
+    redis_url = env_str("KV_URL") or env_str("REDIS_URL")
+    if env_str("VERCEL") and not redis_url:
+        raise RuntimeError("KV_URL or REDIS_URL is required on Vercel for persistent state")
+    store = RedisStore(redis_url) if redis_url else Store(config.state_db)
     client = MlbClient()
     translator = Translator(store)
     formatter = Formatter(client, translator, config)
