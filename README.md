@@ -1,109 +1,143 @@
-# MLB Daily Results Telegram Bot
+# MLB Daily Results Bot на Cloudflare Workers
 
-Бот публикует ежедневный общий пост с результатами MLB в закрытый канал
-`-1003643946438` и умеет править русские названия/фамилии через команды.
+Бот публикует ежедневный общий пост с результатами MLB в закрытый Telegram-канал
+`-1003643946438`, принимает команды через Telegram webhook и сам проверяет
+результаты каждую минуту через Cloudflare Cron Triggers.
 
-## Быстрый старт
+## Что внутри
 
-1. Создайте `.env` по примеру `.env.example`.
-2. Добавьте `@mlb_daily_results_bot` администратором канала с правом публиковать и редактировать сообщения.
-3. Установите зависимости:
+`src/worker.js` - основной Cloudflare Worker.
 
-```powershell
-pip install -r requirements.txt
-```
+`wrangler.toml` - конфигурация Worker, KV binding и cron `* * * * *`.
 
-4. Запустите бота:
+`.dev.vars.example` - пример локальных переменных.
 
-```powershell
-python mlb_daily_results_bot.py
-```
+Workers KV используется для памяти бота: уже опубликованные посты, `message_id`
+и словарь правок имён/команд.
 
-При запуске long polling бот по умолчанию снимает старый Telegram webhook
-(`DELETE_WEBHOOK_ON_START=true`), иначе Telegram может не отдавать апдейты.
-
-## Команды
+## Команды бота
 
 `/today [YYYY-MM-DD]` - показать пост результатов.
 
-`/schedule [YYYY-MM-DD]` - расписание дня с количеством матчей и временем МСК.
+`/schedule [YYYY-MM-DD]` - расписание дня и количество матчей.
 
-`/status [YYYY-MM-DD]` - сколько матчей завершено и опубликован ли пост.
+`/status [YYYY-MM-DD]` - статус игрового дня.
 
-`/post [YYYY-MM-DD]` - отправить пост в канал или обновить уже отправленный.
+`/post [YYYY-MM-DD]` - отправить или обновить пост в канале.
 
-`/refresh [YYYY-MM-DD]` - перегенерировать и отредактировать уже опубликованный пост.
+`/refresh [YYYY-MM-DD]` - перегенерировать опубликованный пост.
 
-`/fix English Name = Русское Имя` - запомнить перевод имени/фамилии игрока.
+`/fix English Name = Русское Имя` - запомнить имя игрока.
 
 `/team Twins = Твинс` - запомнить название команды.
 
-`/replace старый текст = новый текст` - заменить текст в последнем опубликованном посте.
+`/replace старый текст = новый текст` - поправить последний пост.
 
-`/dict [поиск]` - показать сохранённые правки.
+`/dict [поиск]` - показать словарь правок.
 
-`/unknown [YYYY-MM-DD]` - показать имена игроков за день, которых ещё нет в словаре.
+`/unknown [YYYY-MM-DD]` - показать имена без ручной правки.
 
-## Автопостинг
+## Локальная подготовка
 
-При `AUTO_POST=true` бот каждые `AUTO_CHECK_SECONDS` секунд проверяет последние
-`AUTO_LOOKBACK_DAYS` игровых дней MLB. Как только все матчи дня финальные,
-он публикует пост. Повторной публикации за ту же дату не будет: `message_id`
-сохраняется в SQLite.
+```powershell
+npm install
+copy .dev.vars.example .dev.vars
+```
 
-## Деплой: постоянный worker
-
-Проект можно запускать как постоянный worker-процесс. Для PaaS есть `Procfile`,
-для контейнера - `Dockerfile`. Важно сохранить `state/` между перезапусками,
-иначе бот не будет помнить уже опубликованные `message_id` и словарь правок.
-
-## Деплой: Vercel + cron-jobs.org
-
-Vercel не запускает бесконечный polling-процесс. Для Vercel используются HTTP
-functions:
-
-`/api/telegram` - Telegram webhook для команд.
-
-`/api/cron?secret=...` - проверка результатов и автопостинг.
-
-`/api/health` - быстрая проверка переменных окружения.
-
-На Vercel нужно добавить переменные:
+В `.dev.vars` впишите:
 
 ```env
 TELEGRAM_BOT_TOKEN=...
 TARGET_CHAT_ID=-1003643946438
 CRON_SECRET=длинная_случайная_строка
-KV_URL=...
-FAST_PITCHER_RECORDS=true
 ```
 
-`KV_URL` или `REDIS_URL` обязателен на Vercel: файловая система serverless
-функций не хранит SQLite между вызовами. Подойдёт Vercel KV / Upstash Redis.
-`FAST_PITCHER_RECORDS=true` берёт рекорды питчеров пачкой и держит cron-функцию
-короткой для serverless-лимитов.
-
-После деплоя задайте Telegram webhook:
-
-```text
-https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<your-project>.vercel.app/api/telegram
-```
-
-В cron-jobs.org создайте задачу каждую минуту:
-
-```text
-https://<your-project>.vercel.app/api/cron?secret=<CRON_SECRET>
-```
-
-Для ручной проверки конкретной даты:
-
-```text
-https://<your-project>.vercel.app/api/cron?secret=<CRON_SECRET>&date=2026-05-03
-```
-
-Для проверки без Telegram:
+Локальный запуск:
 
 ```powershell
-python mlb_daily_results_bot.py --date 2026-05-03 --dry-run
-python mlb_daily_results_bot.py --schedule --date 2026-05-03 --dry-run
+npm run dev
 ```
+
+## Деплой на Cloudflare
+
+1. Авторизуйтесь в Cloudflare:
+
+```powershell
+npx wrangler login
+```
+
+2. Создайте/привяжите KV namespace. В `wrangler.toml` binding уже называется
+`MLB_STATE`. Современный Wrangler может создать KV автоматически при deploy.
+Если попросит ID вручную:
+
+```powershell
+npx wrangler kv namespace create MLB_STATE
+```
+
+Затем вставьте выданный `id` в `wrangler.toml`:
+
+```toml
+[[kv_namespaces]]
+binding = "MLB_STATE"
+id = "..."
+```
+
+3. Задайте secrets:
+
+```powershell
+npx wrangler secret put TELEGRAM_BOT_TOKEN
+npx wrangler secret put CRON_SECRET
+```
+
+4. Деплой:
+
+```powershell
+npm run deploy
+```
+
+После деплоя Cloudflare Cron Trigger будет вызывать Worker каждую минуту.
+Отдельный cron-jobs.org больше не нужен.
+
+## Telegram webhook
+
+После деплоя откройте защищённый endpoint:
+
+```text
+https://<worker-url>/api/set-webhook?secret=<CRON_SECRET>
+```
+
+Он установит webhook на:
+
+```text
+https://<worker-url>/api/telegram
+```
+
+Бот `@mlb_daily_results_bot` должен быть администратором канала с правом
+публиковать и редактировать сообщения.
+
+## Проверки
+
+Health:
+
+```text
+https://<worker-url>/api/health
+```
+
+Ручная проверка cron:
+
+```text
+https://<worker-url>/api/cron?secret=<CRON_SECRET>
+```
+
+Ручная проверка конкретной даты:
+
+```text
+https://<worker-url>/api/cron?secret=<CRON_SECRET>&date=2026-05-03
+```
+
+Логи:
+
+```powershell
+npm run tail
+```
+

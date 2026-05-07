@@ -1,0 +1,10 @@
+TELEGRAM_BOT_TOKEN=123456:replace_me
+TARGET_CHAT_ID=-1003643946438
+CRON_SECRET=replace_with_long_random_string
+ADMIN_CHAT_IDS=
+AUTO_POST=true
+AUTO_LOOKBACK_DAYS=2
+TEAM_EMOJI=😀
+LOCAL_TZ=Europe/Moscow
+MLB_TZ=America/New_York
+

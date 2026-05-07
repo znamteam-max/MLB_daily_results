@@ -1,0 +1,22 @@
+name = "mlb-daily-results"
+main = "src/worker.js"
+compatibility_date = "2026-05-07"
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "MLB_STATE"
+
+[vars]
+TARGET_CHAT_ID = "-1003643946438"
+ADMIN_CHAT_IDS = ""
+AUTO_POST = "true"
+AUTO_LOOKBACK_DAYS = "2"
+TEAM_EMOJI = "😀"
+LOCAL_TZ = "Europe/Moscow"
+MLB_TZ = "America/New_York"
+
+[triggers]
+crons = ["* * * * *"]
+
+[observability]
+enabled = true
