@@ -5,6 +5,7 @@ workers_dev = true
 
 [[kv_namespaces]]
 binding = "MLB_STATE"
+id = "1e98fcfafaa7422ca37639c17adde41f"
 
 [vars]
 TARGET_CHAT_ID = "-1003643946438"
