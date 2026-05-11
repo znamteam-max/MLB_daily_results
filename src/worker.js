@@ -275,6 +275,7 @@ async function route(request, env) {
         cloudflare: true,
         state: env.MLB_STATE ? "kv" : "missing",
         telegram_token: Boolean(env.TELEGRAM_BOT_TOKEN),
+        telegram_webhook_secret: Boolean(env.TELEGRAM_WEBHOOK_SECRET),
         target_chat_id: env.TARGET_CHAT_ID || "-1003643946438",
         auto_post: isTrue(env.AUTO_POST, true),
       });
@@ -287,6 +288,8 @@ async function route(request, env) {
       if (request.method !== "POST") {
         return jsonResponse({ ok: false, error: "method not allowed" }, 405);
       }
+      const webhookAuth = requireTelegramWebhookSecret(request, env);
+      if (webhookAuth) return webhookAuth;
       const update = await request.json();
       await handleUpdate(env, update);
       return jsonResponse({ ok: true });
@@ -304,10 +307,14 @@ async function route(request, env) {
       const auth = requireCronSecret(request, env, url);
       if (auth) return auth;
       const webhookUrl = url.searchParams.get("url") || `${url.origin}/api/telegram`;
-      const result = await telegramRequest(env, "setWebhook", {
+      const payload = {
         url: webhookUrl,
         allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post"],
-      });
+      };
+      if (env.TELEGRAM_WEBHOOK_SECRET) {
+        payload.secret_token = env.TELEGRAM_WEBHOOK_SECRET;
+      }
+      const result = await telegramRequest(env, "setWebhook", payload);
       return jsonResponse({ ok: true, webhook_url: webhookUrl, telegram: result });
     }
 
@@ -320,6 +327,16 @@ async function route(request, env) {
 function normalizePath(pathname) {
   const path = pathname.replace(/\/+$/, "");
   return path || "/";
+}
+
+function requireTelegramWebhookSecret(request, env) {
+  const expected = String(env.TELEGRAM_WEBHOOK_SECRET || "").trim();
+  if (!expected) return null;
+  const provided = request.headers.get("x-telegram-bot-api-secret-token") || "";
+  if (provided !== expected) {
+    return jsonResponse({ ok: false, error: "unauthorized webhook" }, 401);
+  }
+  return null;
 }
 
 function requireCronSecret(request, env, url) {
@@ -1143,4 +1160,3 @@ function jsonResponse(payload, status = 200) {
     },
   });
 }
-

@@ -9,10 +9,10 @@
     "tail": "wrangler tail",
     "check": "node --check src/worker.js",
     "secret:token": "wrangler secret put TELEGRAM_BOT_TOKEN",
-    "secret:cron": "wrangler secret put CRON_SECRET"
+    "secret:cron": "wrangler secret put CRON_SECRET",
+    "secret:webhook": "wrangler secret put TELEGRAM_WEBHOOK_SECRET"
   },
   "devDependencies": {
     "wrangler": "^4.16.0"
   }
 }
-

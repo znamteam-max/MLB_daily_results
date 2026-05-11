@@ -50,6 +50,7 @@ copy .dev.vars.example .dev.vars
 TELEGRAM_BOT_TOKEN=...
 TARGET_CHAT_ID=-1003643946438
 CRON_SECRET=длинная_случайная_строка
+TELEGRAM_WEBHOOK_SECRET=длинная_случайная_строка
 ```
 
 Локальный запуск:
@@ -87,6 +88,7 @@ id = "..."
 ```powershell
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put CRON_SECRET
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 ```
 
 4. Деплой:
@@ -111,6 +113,9 @@ https://<worker-url>/api/set-webhook?secret=<CRON_SECRET>
 ```text
 https://<worker-url>/api/telegram
 ```
+
+Если задан `TELEGRAM_WEBHOOK_SECRET`, Worker будет принимать webhook-запросы
+только с Telegram-заголовком `X-Telegram-Bot-Api-Secret-Token`.
 
 Бот `@mlb_daily_results_bot` должен быть администратором канала с правом
 публиковать и редактировать сообщения.
@@ -140,4 +145,3 @@ https://<worker-url>/api/cron?secret=<CRON_SECRET>&date=2026-05-03
 ```powershell
 npm run tail
 ```
-
