@@ -93,6 +93,7 @@ const PLAYER_RU_DEFAULTS = {
   "Ben Rice": "Бен Райс",
   "Brant Hurter": "Брэнт Хёртер",
   "Brian Abreu": "Брайан Абреу",
+  "Bryan Abreu": "Брайан Абреу",
   "Bryson Stott": "Брайсон Стотт",
   "Caleb Kilian": "Калеб Килиан",
   "Chase DeLauter": "Чейз Делотер",
@@ -164,6 +165,7 @@ const WORD_RU = {
   ben: "Бен",
   brant: "Брэнт",
   brian: "Брайан",
+  bryan: "Брайан",
   bryson: "Брайсон",
   caleb: "Калеб",
   chase: "Чейз",
@@ -276,6 +278,7 @@ async function route(request, env) {
         state: env.MLB_STATE ? "kv" : "missing",
         telegram_token: Boolean(env.TELEGRAM_BOT_TOKEN),
         telegram_webhook_secret: Boolean(env.TELEGRAM_WEBHOOK_SECRET),
+        callback_query: true,
         target_chat_id: env.TARGET_CHAT_ID || "-1003643946438",
         auto_post: isTrue(env.AUTO_POST, true),
       });
@@ -309,7 +312,7 @@ async function route(request, env) {
       const webhookUrl = url.searchParams.get("url") || `${url.origin}/api/telegram`;
       const payload = {
         url: webhookUrl,
-        allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post"],
+        allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"],
       };
       if (env.TELEGRAM_WEBHOOK_SECRET) {
         payload.secret_token = env.TELEGRAM_WEBHOOK_SECRET;
@@ -355,6 +358,11 @@ function requireCronSecret(request, env, url) {
 }
 
 async function handleUpdate(env, update) {
+  if (update.callback_query) {
+    await handleCallbackQuery(env, update.callback_query);
+    return;
+  }
+
   const message =
     update.message || update.edited_message || update.channel_post || update.edited_channel_post || {};
   const chat = message.chat || {};
@@ -370,7 +378,36 @@ async function handleUpdate(env, update) {
     answer = `Ошибка: ${String(error?.message || error)}`;
   }
   if (answer) {
-    await sendMessage(env, chatId, answer);
+    if (typeof answer === "string") {
+      await sendMessage(env, chatId, answer);
+    } else {
+      await sendMessage(env, chatId, answer.text, answer.options || {});
+    }
+  }
+}
+
+async function handleCallbackQuery(env, callbackQuery) {
+  const data = String(callbackQuery.data || "");
+  if (!data.startsWith("edit_names:")) {
+    await answerCallbackQuery(env, callbackQuery.id, "Команда не распознана.");
+    return;
+  }
+
+  const gameDate = data.split(":", 2)[1] || "";
+  const text = [
+    `Правка фамилий за ${gameDate}`,
+    "Отправь в эту группу:",
+    "/fix English Name = Русское Имя",
+    "Я запомню написание и обновлю последний пост.",
+  ].join("\n");
+
+  await answerCallbackQuery(env, callbackQuery.id, "Отправь /fix English Name = Русское Имя. Правка сохранится навсегда.", true);
+
+  const chat = callbackQuery.message?.chat || {};
+  const chatId = chat.id;
+  const messageId = callbackQuery.message?.message_id;
+  if (chatId && chat.type !== "channel") {
+    await sendMessage(env, chatId, text, messageId ? { reply_to_message_id: messageId } : {});
   }
 }
 
@@ -390,7 +427,10 @@ async function handleCommand(env, raw) {
   if (cmd === "/start" || cmd === "/help") return HELP_TEXT;
   if (cmd === "/today") {
     const d = parseOptionalDate(rest) || currentDate;
-    return buildResults(env, d, true);
+    return {
+      text: await buildResults(env, d, true),
+      options: { parse_mode: "HTML", reply_markup: editNamesMarkup(d) },
+    };
   }
   if (cmd === "/schedule") {
     const d = parseOptionalDate(rest) || currentDate;
@@ -432,7 +472,7 @@ async function handleCommand(env, raw) {
     if (!latest) return "Нет сохранённых постов для правки.";
     if (!latest.text.includes(source)) return `Не нашёл в последнем посте: ${source}`;
     const text = latest.text.split(source).join(target);
-    await editMessage(env, latest.chat_id, latest.message_id, text);
+    await editMessage(env, latest.chat_id, latest.message_id, text, postMessageOptions(latest.game_date));
     await updatePostText(env, latest.game_date, text);
     return `Заменил в посте за ${latest.game_date}: ${source} → ${target}`;
   }
@@ -492,14 +532,15 @@ async function checkSingleDate(env, d) {
 
 async function sendOrEditChannelPost(env, d, text) {
   if (text.length > 4096) throw new Error(`Telegram message is too long: ${text.length} chars`);
+  const options = postMessageOptions(d);
   const existing = await getPost(env, d);
   if (existing) {
-    await editMessage(env, existing.chat_id, existing.message_id, text);
+    await editMessage(env, existing.chat_id, existing.message_id, text, options);
     await savePost(env, d, existing.chat_id, existing.message_id, text);
     return `Обновил пост за ${d}.`;
   }
   const chatId = env.TARGET_CHAT_ID || "-1003643946438";
-  const messageId = await sendMessage(env, chatId, text);
+  const messageId = await sendMessage(env, chatId, text, options);
   await savePost(env, d, chatId, messageId, text);
   return `Опубликовал пост за ${d}.`;
 }
@@ -508,7 +549,7 @@ async function refreshPost(env, d) {
   const existing = await getPost(env, d);
   if (!existing) return `За ${d} ещё нет сохранённого поста. Используй /post ${d}.`;
   const text = await buildResults(env, d, false);
-  await editMessage(env, existing.chat_id, existing.message_id, text);
+  await editMessage(env, existing.chat_id, existing.message_id, text, postMessageOptions(d));
   await savePost(env, d, existing.chat_id, existing.message_id, text);
   return `Перегенерировал и обновил пост за ${d}.`;
 }
@@ -520,11 +561,12 @@ async function buildResults(env, d, includePending = true, knownGames = null) {
 
   const translator = createTranslator(env);
   const pitcherRecords = await preloadPitcherSeasonRecords(games);
+  const qualityStartWinners = await preloadQualityStartWinners(games);
   const blocks = [header];
 
   for (const game of games.slice().sort(gameSortKey)) {
     if (isFinalGame(game)) {
-      blocks.push(await finalGameBlock(env, translator, game, d, pitcherRecords));
+      blocks.push(await finalGameBlock(env, translator, game, d, pitcherRecords, qualityStartWinners));
     } else if (includePending) {
       blocks.push(await pendingGameBlock(env, translator, game));
     }
@@ -589,12 +631,14 @@ async function unknownPlayers(env, d) {
   return out;
 }
 
-async function finalGameBlock(env, translator, game, d, pitcherRecords) {
+async function finalGameBlock(env, translator, game, d, pitcherRecords, qualityStartWinners) {
   const home = await teamScoreLine(env, translator, game, "home");
   const away = await teamScoreLine(env, translator, game, "away");
-  const decisions = await decisionsLine(translator, game, pitcherRecords);
+  const decisions = await decisionsLine(translator, game, pitcherRecords, qualityStartWinners);
   const homers = await homeRunsLine(translator, game);
-  return [home, away, "", decisions, homers].join("\n").trim();
+  const lines = [home, away, "", decisions];
+  if (homers) lines.push(homers);
+  return lines.join("\n").trim();
 }
 
 async function pendingGameBlock(env, translator, game) {
@@ -609,7 +653,7 @@ async function teamScoreLine(env, translator, game, side) {
   const name = await translator.team(team);
   const score = intOrZero(teamData.score);
   const record = teamData.leagueRecord || {};
-  return `${env.TEAM_EMOJI || "😀"} ${name}: ${score} (${intOrZero(record.wins)}-${intOrZero(record.losses)})`;
+  return `${env.TEAM_EMOJI || "😀"} <b>${escapeHtml(name)}</b>: ${score} (${intOrZero(record.wins)}-${intOrZero(record.losses)})`;
 }
 
 async function teamLineName(env, translator, game, side) {
@@ -617,21 +661,22 @@ async function teamLineName(env, translator, game, side) {
   return `${env.TEAM_EMOJI || "😀"} ${await translator.team(team)}`;
 }
 
-async function decisionsLine(translator, game, pitcherRecords) {
+async function decisionsLine(translator, game, pitcherRecords, qualityStartWinners) {
   const decisions = game.decisions || {};
   const parts = [];
-  if (decisions.winner) parts.push(`Победа: ${await pitcherWithRecord(translator, decisions.winner, pitcherRecords, "wl")}`);
+  if (decisions.winner) parts.push(`Победа: ${await pitcherWithRecord(translator, decisions.winner, pitcherRecords, "wl", qualityStartWinners.has(Number(decisions.winner.id)))}`);
   if (decisions.loser) parts.push(`поражение: ${await pitcherWithRecord(translator, decisions.loser, pitcherRecords, "wl")}`);
   if (decisions.save) parts.push(`сейв: ${await pitcherWithRecord(translator, decisions.save, pitcherRecords, "save")}`);
   return parts.length ? parts.join("; ") : "Победа/поражение: —";
 }
 
-async function pitcherWithRecord(translator, person, pitcherRecords, mode) {
+async function pitcherWithRecord(translator, person, pitcherRecords, mode, qualityStart = false) {
   const name = await translator.player(person.fullName || "");
   const record = pitcherRecords.get(Number(person.id));
-  if (!record) return name;
-  if (mode === "save") return `${name} (${record.saves})`;
-  return `${name} (${record.wins}-${record.losses})`;
+  const label = `${escapeHtml(name)}${qualityStart ? " 🎯" : ""}`;
+  if (!record) return label;
+  if (mode === "save") return `${label} (${record.saves})`;
+  return `${label} (${record.wins}-${record.losses})`;
 }
 
 async function homeRunsLine(translator, game) {
@@ -657,16 +702,20 @@ async function homeRunsLine(translator, game) {
 
   const home = formatHrItems([...bySide.home.values()]);
   const away = formatHrItems([...bySide.away.values()]);
-  const value = home && away ? `${home} — ${away}` : home || away || "—";
+  if (!home && !away) return "";
+  const value = home && away ? `${home} — ${away}` : home || away;
   return `Хоум-раны: ${value}`;
 }
 
 function formatHrItems(items) {
   return items
     .map((item) => {
-      if (item.count > 1 && item.seasonTotal !== null) return `${item.name} ${item.count} (${item.seasonTotal})`;
-      if (item.seasonTotal !== null) return `${item.name} (${item.seasonTotal})`;
-      return item.name;
+      const fire = item.count >= 2 ? " 🔥" : "";
+      const name = escapeHtml(item.name);
+      if (item.count > 1 && item.seasonTotal !== null) return `${name} ${item.count} (${item.seasonTotal})${fire}`;
+      if (item.seasonTotal !== null) return `${name} (${item.seasonTotal})${fire}`;
+      if (item.count > 1) return `${name} ${item.count}${fire}`;
+      return `${name}${fire}`;
     })
     .join(", ");
 }
@@ -711,6 +760,51 @@ async function preloadPitcherSeasonRecords(games) {
     }
   }
   return records;
+}
+
+async function preloadQualityStartWinners(games) {
+  const winners = new Set();
+  const finalGames = games.filter((game) => isFinalGame(game) && game.decisions?.winner?.id && game.gamePk);
+  await Promise.all(
+    finalGames.map(async (game) => {
+      try {
+        const winnerId = Number(game.decisions.winner.id);
+        const boxscore = await fetchJson(`${MLB_API}/game/${game.gamePk}/boxscore`);
+        const pitcher = findBoxscorePlayer(boxscore, winnerId);
+        const pitching = pitcher?.stats?.pitching || {};
+        const started = intOrZero(pitching.gamesStarted) > 0;
+        const outs = intOrZero(pitching.outs) || inningsToOuts(pitching.inningsPitched);
+        const earnedRuns = intOrZero(pitching.earnedRuns);
+        if (started && outs >= 18 && earnedRuns <= 3) {
+          winners.add(winnerId);
+        }
+      } catch (error) {
+        console.log(`quality-start lookup failed for ${game.gamePk}: ${String(error?.message || error)}`);
+      }
+    }),
+  );
+  return winners;
+}
+
+function findBoxscorePlayer(boxscore, playerId) {
+  for (const side of ["home", "away"]) {
+    const players = boxscore?.teams?.[side]?.players || {};
+    const direct = players[`ID${playerId}`];
+    if (direct) return direct;
+    for (const player of Object.values(players)) {
+      if (Number(player?.person?.id) === Number(playerId)) return player;
+    }
+  }
+  return null;
+}
+
+function inningsToOuts(value) {
+  const raw = String(value || "");
+  if (!raw) return 0;
+  const [whole, fraction = "0"] = raw.split(".");
+  const fullInnings = intOrZero(whole);
+  const partial = fraction === "1" ? 1 : fraction === "2" ? 2 : 0;
+  return fullInnings * 3 + partial;
 }
 
 function createTranslator(env) {
@@ -849,21 +943,46 @@ async function telegramRequest(env, method, payload) {
   return data;
 }
 
-async function sendMessage(env, chatId, text) {
+async function answerCallbackQuery(env, callbackQueryId, text, showAlert = false) {
+  await telegramRequest(env, "answerCallbackQuery", {
+    callback_query_id: callbackQueryId,
+    text,
+    show_alert: showAlert,
+  });
+}
+
+function postMessageOptions(gameDate) {
+  return {
+    parse_mode: "HTML",
+    reply_markup: editNamesMarkup(gameDate),
+  };
+}
+
+function editNamesMarkup(gameDate) {
+  return {
+    inline_keyboard: [
+      [{ text: "✏️ Править фамилии", callback_data: `edit_names:${gameDate}` }],
+    ],
+  };
+}
+
+async function sendMessage(env, chatId, text, extra = {}) {
   const data = await telegramRequest(env, "sendMessage", {
     chat_id: chatId,
     text,
     disable_web_page_preview: true,
+    ...extra,
   });
   return Number(data.result?.message_id || 0);
 }
 
-async function editMessage(env, chatId, messageId, text) {
+async function editMessage(env, chatId, messageId, text, extra = {}) {
   await telegramRequest(env, "editMessageText", {
     chat_id: chatId,
     message_id: Number(messageId),
     text,
     disable_web_page_preview: true,
+    ...extra,
   });
 }
 
@@ -1149,6 +1268,13 @@ function isTrue(value, fallback = false) {
 
 function pad2(value) {
   return String(value).padStart(2, "0");
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function jsonResponse(payload, status = 200) {
