@@ -468,7 +468,7 @@ async function handleCommand(env, raw) {
   }
   if (cmd === "/status") {
     const d = parseOptionalDate(rest) || currentDate;
-    const posted = Boolean(await getPost(env, d));
+    const posted = isTargetPost(env, await getPost(env, d));
     return statusSummary(env, d, posted);
   }
   if (cmd === "/post") {
@@ -576,7 +576,7 @@ async function ensureChannelMenu(env, selectedDate = null, force = false) {
 async function buildChannelMenu(env, selectedDate) {
   const d = selectedDate || currentGameDate(env.MLB_TZ || "America/New_York");
   const games = await gamesForDate(d);
-  const posted = Boolean(await getPost(env, d));
+  const posted = isTargetPost(env, await getPost(env, d));
   const summary = summarizeGames(games);
   const word = pluralRu(summary.total, "матч", "матча", "матчей");
   const lines = [
@@ -629,7 +629,8 @@ function menuMarkup(env, selectedDate) {
 }
 
 async function checkSingleDate(env, d) {
-  if (await getPost(env, d)) return `${d}: already posted`;
+  const existing = await getPost(env, d);
+  if (existing && isTargetPost(env, existing)) return `${d}: already posted`;
   const games = await gamesForDate(d);
   if (!allDone(games)) {
     const final = games.filter(isFinalGame).length;
@@ -644,16 +645,20 @@ async function checkSingleDate(env, d) {
 async function sendOrEditChannelPost(env, d, text) {
   if (text.length > 4096) throw new Error(`Telegram message is too long: ${text.length} chars`);
   const options = postMessageOptions(d);
+  const chatId = env.TARGET_CHAT_ID || "-1003643946438";
   const existing = await getPost(env, d);
-  if (existing) {
+  if (existing && isTargetPost(env, existing)) {
     await editMessage(env, existing.chat_id, existing.message_id, text, options);
     await savePost(env, d, existing.chat_id, existing.message_id, text);
     return `Обновил пост за ${d}.`;
   }
-  const chatId = env.TARGET_CHAT_ID || "-1003643946438";
   const messageId = await sendMessage(env, chatId, text, options);
   await savePost(env, d, chatId, messageId, text);
   return `Опубликовал пост за ${d}.`;
+}
+
+function isTargetPost(env, post) {
+  return String(post?.chat_id || "") === String(env.TARGET_CHAT_ID || "-1003643946438");
 }
 
 async function refreshPost(env, d) {
