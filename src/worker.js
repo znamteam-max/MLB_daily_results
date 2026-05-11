@@ -246,6 +246,20 @@ const DEFAULT_TEAM_MAP = new Map([
   ...Object.entries(TEAM_RU_BY_NAME).map(([k, v]) => [normKey(k), v]),
 ]);
 
+const POSITION_RU = {
+  P: "питчер",
+  C: "кэтчер",
+  "1B": "1-я база",
+  "2B": "2-я база",
+  "3B": "3-я база",
+  SS: "шортстоп",
+  LF: "левый аутфилд",
+  CF: "центрфилд",
+  RF: "правый аутфилд",
+  OF: "аутфилд",
+  DH: "DH",
+};
+
 export default {
   async fetch(request, env) {
     return route(request, env);
@@ -378,13 +392,20 @@ async function handleUpdate(env, update) {
     update.message || update.edited_message || update.channel_post || update.edited_channel_post || {};
   const chat = message.chat || {};
   const chatId = chat.id;
+  const fromId = message.from?.id || chatId;
   const text = String(message.text || "").trim();
-  if (!chatId || !text.startsWith("/")) return;
+  if (!chatId || !text) return;
   if (!isAllowedChat(env, Number(chatId), String(chat.type || ""))) return;
 
   let answer = "";
   try {
-    answer = await handleCommand(env, text);
+    if (!text.startsWith("/")) {
+      const pendingPlayer = await getPendingPlayerEdit(env, fromId);
+      if (!pendingPlayer) return;
+      answer = await savePendingPlayerTranslation(env, fromId, pendingPlayer, text);
+    } else {
+      answer = await handleCommand(env, text, { fromId, chatId });
+    }
   } catch (error) {
     answer = `Ошибка: ${String(error?.message || error)}`;
   }
@@ -414,6 +435,40 @@ async function handleCallbackQuery(env, callbackQuery) {
     return;
   }
 
+  if (data.startsWith("player_pick:")) {
+    const userId = callbackQuery.from?.id;
+    if (!userId) {
+      await answerCallbackQuery(env, callbackQuery.id, "Не вижу пользователя для правки.");
+      return;
+    }
+    const playerId = Number(data.split(":", 2)[1]);
+    const player = await getPlayerById(playerId);
+    if (!player) {
+      await answerCallbackQuery(env, callbackQuery.id, "Игрок не найден.");
+      return;
+    }
+    await savePendingPlayerEdit(env, userId, player);
+    const text = [
+      `Игрок: ${player.fullName}`,
+      `Команда: ${player.currentTeam?.name || "—"}`,
+      `Позиция: ${positionLabel(player)}`,
+      `Текущее RU: ${await playerRuDisplay(env, player)}`,
+      "",
+      "Отправь новое русское написание следующим сообщением.",
+      "Например: Макс Манси",
+    ].join("\n");
+    const chat = callbackQuery.message?.chat || {};
+    const replyChatId = chat.type === "channel" ? userId : (chat.id || userId);
+    try {
+      await sendMessage(env, replyChatId, text);
+      await answerCallbackQuery(env, callbackQuery.id, `Выбран: ${player.fullName}`);
+    } catch (error) {
+      console.log(`player edit prompt failed: ${String(error?.message || error)}`);
+      await answerCallbackQuery(env, callbackQuery.id, `Выбран: ${player.fullName}. Напиши боту новое русское написание отдельным сообщением.`, true);
+    }
+    return;
+  }
+
   if (!data.startsWith("edit_names:")) {
     await answerCallbackQuery(env, callbackQuery.id, "Команда не распознана.");
     return;
@@ -424,10 +479,14 @@ async function handleCallbackQuery(env, callbackQuery) {
     `Правка фамилий за ${gameDate}`,
     "Отправь в эту группу:",
     "/fix English Name = Русское Имя",
-    "Я запомню написание и обновлю последний пост.",
+    "",
+    "Или найди игрока в общей базе:",
+    "/findplayer Muncy",
+    "",
+    "Я запомню написание и обновлю последний пост в канале.",
   ].join("\n");
 
-  await answerCallbackQuery(env, callbackQuery.id, "Отправь /fix English Name = Русское Имя. Правка сохранится навсегда.", true);
+  await answerCallbackQuery(env, callbackQuery.id, "Отправь /findplayer фамилия или /fix English Name = Русское Имя.", true);
 
   const chat = callbackQuery.message?.chat || {};
   const chatId = chat.id;
@@ -444,7 +503,7 @@ function isAllowedChat(env, chatId, chatType) {
   return admins.has(chatId) || chatType === "private";
 }
 
-async function handleCommand(env, raw) {
+async function handleCommand(env, raw, context = {}) {
   const [first, ...restParts] = raw.split(/\s+/);
   const cmd = first.split("@", 1)[0].toLowerCase();
   const rest = raw.slice(first.length).trim();
@@ -478,27 +537,32 @@ async function handleCommand(env, raw) {
   }
   if (cmd === "/refresh") {
     const d = parseOptionalDate(rest) || currentDate;
-    return refreshPost(env, d);
+    return tryRefreshPost(env, d);
   }
-  if (cmd === "/fix" || cmd === "/player" || cmd === "/name") {
+  if (cmd === "/findplayer" || cmd === "/playersearch" || (cmd === "/player" && !hasAssignment(rest))) {
+    return findPlayerMessage(env, rest);
+  }
+  if (cmd === "/fix" || cmd === "/name" || (cmd === "/player" && hasAssignment(rest))) {
     const [source, target] = splitAssignment(rest);
-    await putTranslation(env, "player", source, target);
+    await putPlayerTranslation(env, { fullName: source }, target);
     let message = `Запомнил: ${source} → ${target}`;
-    const latest = await latestPost(env);
-    if (latest) message += `\n${await refreshPost(env, latest.game_date)}`;
+    const latest = await latestPost(env, true);
+    if (latest) message += `\n${await tryRefreshPost(env, latest.game_date)}`;
+    else message += "\nПост в целевом канале пока не найден. Новая база применится при следующей публикации.";
     return message;
   }
   if (cmd === "/team") {
     const [source, target] = splitAssignment(rest);
     await putTranslation(env, "team", source, target);
     let message = `Запомнил команду: ${source} → ${target}`;
-    const latest = await latestPost(env);
-    if (latest) message += `\n${await refreshPost(env, latest.game_date)}`;
+    const latest = await latestPost(env, true);
+    if (latest) message += `\n${await tryRefreshPost(env, latest.game_date)}`;
+    else message += "\nПост в целевом канале пока не найден. Новая база применится при следующей публикации.";
     return message;
   }
   if (cmd === "/replace") {
     const [source, target] = splitAssignment(rest);
-    const latest = await latestPost(env);
+    const latest = await latestPost(env, true);
     if (!latest) return "Нет сохранённых постов для правки.";
     if (!latest.text.includes(source)) return `Не нашёл в последнем посте: ${source}`;
     const text = latest.text.split(source).join(target);
@@ -526,7 +590,8 @@ const HELP_TEXT = `Команды MLB-бота:
 /status [YYYY-MM-DD] - статус игрового дня
 /post [YYYY-MM-DD] - отправить/обновить пост в канале
 /refresh [YYYY-MM-DD] - перегенерировать уже опубликованный пост
-/fix English Name = Русское Имя - запомнить имя игрока
+/findplayer Muncy - найти игрока в базе MLB и исправить русское написание
+/fix English Name = Русское Имя - быстрый ручной перевод имени или фамилии
 /team Twins = Твинс - запомнить название команды
 /replace старый текст = новый текст - поправить последний пост
 /dict [поиск] - показать словарь правок
@@ -540,7 +605,7 @@ async function cronCheckOnce(env) {
 
   for (let delta = 0; delta < lookback; delta += 1) {
     const d = addDays(today, -delta);
-    if (await getPost(env, d)) {
+    if (isTargetPost(env, await getPost(env, d))) {
       results.push(`${d}: already posted`);
       continue;
     }
@@ -663,11 +728,230 @@ function isTargetPost(env, post) {
 
 async function refreshPost(env, d) {
   const existing = await getPost(env, d);
-  if (!existing) return `За ${d} ещё нет сохранённого поста. Используй /post ${d}.`;
+  if (!existing || !isTargetPost(env, existing)) return `За ${d} ещё нет сохранённого поста в канале. Используй /post ${d}.`;
   const text = await buildResults(env, d, false);
   await editMessage(env, existing.chat_id, existing.message_id, text, postMessageOptions(d));
   await savePost(env, d, existing.chat_id, existing.message_id, text);
   return `Перегенерировал и обновил пост за ${d}.`;
+}
+
+async function tryRefreshPost(env, d) {
+  try {
+    return await refreshPost(env, d);
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (message.includes("message to edit not found")) {
+      return `Правка сохранена. Старое сообщение за ${d} Telegram уже не нашёл, поэтому обновить его нельзя. Новая база применится при следующей публикации.`;
+    }
+    return `Правка сохранена, но пост за ${d} не обновился: ${message}`;
+  }
+}
+
+async function findPlayerMessage(env, query) {
+  const q = String(query || "").trim();
+  if (q.length < 2) return "Напиши: /findplayer Muncy";
+
+  const players = await searchPlayers(q);
+  if (!players.length) return `Игроки не найдены: ${q}`;
+
+  const rows = [];
+  const lines = [`Нашёл игроков по запросу "${q}":`, ""];
+  for (const [index, player] of players.slice(0, 8).entries()) {
+    const team = playerTeamLabel(player);
+    const position = positionLabel(player);
+    const currentRu = await playerRuDisplay(env, player);
+    lines.push(`${index + 1}. ${player.fullName} • ${team} • ${position}`);
+    lines.push(`   RU: ${currentRu}`);
+    rows.push([{ text: `${player.fullName} • ${team} • ${position}`, callback_data: `player_pick:${player.id}` }]);
+  }
+  lines.push("", "Выбери игрока кнопкой, затем отправь правильное русское написание.");
+
+  return {
+    text: lines.join("\n"),
+    options: { reply_markup: { inline_keyboard: rows } },
+  };
+}
+
+async function searchPlayers(query) {
+  const url = `${MLB_API}/people/search?names=${encodeURIComponent(query)}&sportIds=1&active=true&hydrate=currentTeam`;
+  const data = await fetchJson(url);
+  const seen = new Set();
+  return (data.people || [])
+    .filter((player) => player?.id && player?.fullName && !seen.has(Number(player.id)) && seen.add(Number(player.id)))
+    .sort((a, b) => {
+      const aTeam = a.currentTeam?.name ? 1 : 0;
+      const bTeam = b.currentTeam?.name ? 1 : 0;
+      if (aTeam !== bTeam) return bTeam - aTeam;
+      return String(a.fullName).localeCompare(String(b.fullName));
+    });
+}
+
+async function getPlayerById(playerId) {
+  if (!Number.isFinite(Number(playerId))) return null;
+  const data = await fetchJson(`${MLB_API}/people/${Number(playerId)}?hydrate=currentTeam`);
+  return data.people?.[0] || null;
+}
+
+async function playerRuDisplay(env, player) {
+  const translator = createTranslator(env);
+  return translator.player(player);
+}
+
+async function savePendingPlayerEdit(env, userId, player) {
+  if (!userId) return;
+  await env.MLB_STATE.put(`pending_player_edit:${userId}`, JSON.stringify(normalizePlayerRecord(player)), {
+    expirationTtl: 10 * 60,
+  });
+}
+
+async function getPendingPlayerEdit(env, userId) {
+  if (!userId) return null;
+  return kvGetJson(env, `pending_player_edit:${userId}`);
+}
+
+async function clearPendingPlayerEdit(env, userId) {
+  if (!userId) return;
+  await env.MLB_STATE.delete(`pending_player_edit:${userId}`);
+}
+
+async function savePendingPlayerTranslation(env, userId, player, text) {
+  const target = String(text || "").trim();
+  if (/^(отмена|cancel)$/i.test(target)) {
+    await clearPendingPlayerEdit(env, userId);
+    return "Правку игрока отменил.";
+  }
+  if (target.length < 2) return "Напиши русское написание минимум из двух символов или отправь «отмена».";
+
+  const saved = await putPlayerTranslation(env, player, target);
+  await clearPendingPlayerEdit(env, userId);
+
+  let message = `Запомнил игрока: ${saved.source} → ${saved.target}`;
+  const latest = await latestPost(env, true);
+  if (latest) message += `\n${await tryRefreshPost(env, latest.game_date)}`;
+  else message += "\nПост в целевом канале пока не найден. Новая база применится при следующей публикации.";
+  return message;
+}
+
+async function putPlayerTranslation(env, player, target) {
+  const source = playerFullName(player);
+  const playerId = playerPersonId(player);
+  if (!source) throw new Error("Не вижу английское имя игрока.");
+  const rawTarget = String(target || "").replace(/\s+/g, " ").trim();
+  if (!rawTarget) throw new Error("Не вижу русское написание игрока.");
+
+  const normalizedTarget = normalizePlayerTranslationTarget(player, rawTarget);
+  const now = new Date().toISOString();
+  const base = {
+    kind: "player",
+    source,
+    source_norm: normKey(source),
+    target: normalizedTarget,
+    player_id: playerId || null,
+    team: playerTeamLabel(player),
+    position: positionLabel(player),
+    updated_at: now,
+  };
+
+  if (playerId) {
+    await env.MLB_STATE.put(
+      translationKey("player_id", String(playerId)),
+      JSON.stringify({ ...base, kind: "player_id", source: String(playerId), source_norm: normKey(String(playerId)) }),
+    );
+  }
+
+  await env.MLB_STATE.put(translationKey("player", source), JSON.stringify(base));
+  const clean = cleanPlayerSource(source);
+  if (clean && normKey(clean) !== normKey(source)) {
+    await env.MLB_STATE.put(translationKey("player", clean), JSON.stringify({ ...base, source: clean, source_norm: normKey(clean) }));
+  }
+
+  const lastName = playerLastName(source);
+  if (lastName && normKey(lastName) !== normKey(source) && isSingleWord(rawTarget)) {
+    await env.MLB_STATE.put(
+      translationKey("player", lastName),
+      JSON.stringify({
+        ...base,
+        kind: "player",
+        source: lastName,
+        source_norm: normKey(lastName),
+        target: rawTarget,
+        scope: "last_name",
+      }),
+    );
+  }
+
+  return { source, target: normalizedTarget };
+}
+
+function normalizePlayerRecord(player) {
+  return {
+    id: playerPersonId(player),
+    fullName: playerFullName(player),
+    currentTeam: player.currentTeam
+      ? {
+          id: player.currentTeam.id || null,
+          name: player.currentTeam.name || "",
+          teamName: player.currentTeam.teamName || "",
+          clubName: player.currentTeam.clubName || "",
+          abbreviation: player.currentTeam.abbreviation || "",
+        }
+      : null,
+    primaryPosition: player.primaryPosition
+      ? {
+          abbreviation: player.primaryPosition.abbreviation || "",
+          name: player.primaryPosition.name || "",
+        }
+      : null,
+  };
+}
+
+function normalizePlayerTranslationTarget(player, target) {
+  const raw = String(target || "").replace(/\s+/g, " ").trim();
+  if (!isSingleWord(raw)) return raw;
+  const fullName = cleanPlayerSource(playerFullName(player));
+  const parts = fullName.split(/\s+/).filter(Boolean);
+  if (parts.length < 2) return raw;
+  const prefix = wordsRu(parts.slice(0, -1).join(" "));
+  return prefix ? `${prefix} ${raw}` : raw;
+}
+
+function playerFullName(player) {
+  if (!player) return "";
+  if (typeof player === "string") return player.replace(/\s+/g, " ").trim();
+  return String(player.fullName || player.person?.fullName || "").replace(/\s+/g, " ").trim();
+}
+
+function playerPersonId(player) {
+  const id = typeof player === "object" && player ? (player.id || player.person?.id) : null;
+  const numeric = Number(id);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
+function playerTeamLabel(player) {
+  const team = player?.currentTeam || {};
+  return team.abbreviation || team.teamName || team.clubName || team.name || "без команды";
+}
+
+function positionLabel(player) {
+  const abbr = String(player?.primaryPosition?.abbreviation || "").trim();
+  if (!abbr) return "позиция не указана";
+  return POSITION_RU[abbr] || abbr;
+}
+
+function playerLastName(name) {
+  const parts = cleanPlayerSource(name).split(/\s+/).filter(Boolean);
+  return parts.length > 1 ? parts[parts.length - 1] : "";
+}
+
+function withLastNameOverride(name, lastNameOverride) {
+  const parts = cleanPlayerSource(name).split(/\s+/).filter(Boolean);
+  if (parts.length < 2) return lastNameOverride;
+  const prefix = wordsRu(parts.slice(0, -1).join(" "));
+  return prefix ? `${prefix} ${lastNameOverride}` : lastNameOverride;
+}
+
+function isSingleWord(value) {
+  return !/[\s-]/.test(String(value || "").trim());
 }
 
 async function buildResults(env, d, includePending = true, knownGames = null) {
@@ -792,7 +1076,7 @@ async function decisionsLine(translator, game, pitcherRecords, qualityStartWinne
 }
 
 async function pitcherWithRecord(translator, person, pitcherRecords, mode, qualityStart = false) {
-  const name = await translator.player(person.fullName || "");
+  const name = await translator.player(person);
   const record = pitcherRecords.get(Number(person.id));
   const label = `${escapeHtml(name)}${qualityStart ? " 🎯" : ""}`;
   if (!record) return label;
@@ -810,7 +1094,7 @@ async function homeRunsLine(translator, game) {
     const key = normKey(rawName);
     if (!bySide[side].has(key)) {
       bySide[side].set(key, {
-        name: await translator.player(rawName),
+        name: await translator.player(hr.matchup?.batter || rawName),
         count: 0,
         seasonTotal: null,
       });
@@ -948,15 +1232,25 @@ function createTranslator(env) {
       }
       return wordsRu(team.teamName || team.name || "Team");
     },
-    async player(name) {
-      const raw = String(name || "").replace(/\s+/g, " ").trim();
+    async player(player) {
+      const raw = playerFullName(player);
       if (!raw) return "";
+      const id = playerPersonId(player);
+      if (id) {
+        const byId = await translated("player_id", String(id));
+        if (byId) return byId;
+      }
       const override = await translated("player", raw);
       if (override) return override;
       const clean = cleanPlayerSource(raw);
       if (clean !== raw) {
         const cleanOverride = await translated("player", clean);
         if (cleanOverride) return cleanOverride;
+      }
+      const lastName = playerLastName(clean);
+      if (lastName) {
+        const lastNameOverride = await translated("player", lastName);
+        if (lastNameOverride) return withLastNameOverride(clean, lastNameOverride);
       }
       return DEFAULT_PLAYER_MAP.get(normKey(raw)) || DEFAULT_PLAYER_MAP.get(normKey(clean)) || wordsRu(clean);
     },
@@ -1038,15 +1332,19 @@ async function getPost(env, d) {
   return kvGetJson(env, `post:${d}`);
 }
 
-async function latestPost(env) {
+async function latestPost(env, targetOnly = false) {
   const latestDate = await env.MLB_STATE.get("latest_post_date");
   if (latestDate) {
     const post = await getPost(env, latestDate);
-    if (post) return post;
+    if (post && (!targetOnly || isTargetPost(env, post))) return post;
   }
   const list = await env.MLB_STATE.list({ prefix: "post:", limit: 1000 });
-  const dates = list.keys.map((item) => item.name.replace(/^post:/, "")).sort();
-  return dates.length ? getPost(env, dates[dates.length - 1]) : null;
+  const dates = list.keys.map((item) => item.name.replace(/^post:/, "")).sort().reverse();
+  for (const date of dates) {
+    const post = await getPost(env, date);
+    if (post && (!targetOnly || isTargetPost(env, post))) return post;
+  }
+  return null;
 }
 
 async function updatePostText(env, d, text) {
@@ -1130,14 +1428,25 @@ async function editMessage(env, chatId, messageId, text, extra = {}) {
 }
 
 async function fetchJson(url) {
-  const response = await fetch(url, {
-    headers: {
-      accept: "application/json",
-      "user-agent": "MLB Daily Results Cloudflare Worker/1.0",
-    },
-  });
-  if (!response.ok) throw new Error(`GET failed ${response.status}: ${url}`);
-  return response.json();
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          accept: "application/json",
+          "user-agent": "MLB Daily Results Cloudflare Worker/1.0",
+        },
+      });
+      if (response.ok) return response.json();
+      const error = new Error(`GET failed ${response.status}: ${url}`);
+      if (response.status < 500) throw error;
+      lastError = error;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 1) throw error;
+    }
+  }
+  throw lastError;
 }
 
 function seriesTitle(games) {
@@ -1266,6 +1575,10 @@ function splitAssignment(value) {
     }
   }
   throw new Error("Нужен формат: /fix English Name = Русское Имя");
+}
+
+function hasAssignment(value) {
+  return ["=", "->", "→"].some((sep) => String(value || "").includes(sep));
 }
 
 function parseChatIds(raw) {
