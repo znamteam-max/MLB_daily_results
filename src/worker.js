@@ -278,6 +278,7 @@ async function route(request, env) {
         state: env.MLB_STATE ? "kv" : "missing",
         telegram_token: Boolean(env.TELEGRAM_BOT_TOKEN),
         telegram_webhook_secret: Boolean(env.TELEGRAM_WEBHOOK_SECRET),
+        cron_secret: Boolean(env.CRON_SECRET),
         callback_query: true,
         target_chat_id: env.TARGET_CHAT_ID || "-1003643946438",
         auto_post: isTrue(env.AUTO_POST, true),
@@ -343,9 +344,9 @@ function requireTelegramWebhookSecret(request, env) {
 }
 
 function requireCronSecret(request, env, url) {
-  const expected = String(env.CRON_SECRET || "").trim();
+  const expected = String(env.CRON_SECRET || env.TELEGRAM_WEBHOOK_SECRET || "").trim();
   if (!expected) {
-    return jsonResponse({ ok: false, error: "CRON_SECRET is not set" }, 500);
+    return jsonResponse({ ok: false, error: "CRON_SECRET or TELEGRAM_WEBHOOK_SECRET is not set" }, 500);
   }
   const auth = request.headers.get("authorization") || "";
   const provided = auth.toLowerCase().startsWith("bearer ")
