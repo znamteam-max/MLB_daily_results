@@ -254,7 +254,9 @@ export default {
   async scheduled(_controller, env, _ctx) {
     if (!isTrue(env.AUTO_POST, true)) return;
     const results = await cronCheckOnce(env);
+    const menu = await ensureChannelMenu(env);
     console.log(JSON.stringify({ results }));
+    console.log(JSON.stringify({ menu }));
   },
 };
 
@@ -267,7 +269,7 @@ async function route(request, env) {
       return jsonResponse({
         ok: true,
         service: "mlb-daily-results-cloudflare",
-        endpoints: ["/api/health", "/api/telegram", "/api/cron", "/api/set-webhook"],
+        endpoints: ["/api/health", "/api/telegram", "/api/cron", "/api/menu", "/api/set-webhook"],
       });
     }
 
@@ -305,6 +307,14 @@ async function route(request, env) {
       const targetDate = parseOptionalDate(url.searchParams.get("date") || "");
       const results = targetDate ? [await checkSingleDate(env, targetDate)] : await cronCheckOnce(env);
       return jsonResponse({ ok: true, results });
+    }
+
+    if (path === "/menu" || path === "/api/menu") {
+      const auth = requireCronSecret(request, env, url);
+      if (auth) return auth;
+      const targetDate = parseOptionalDate(url.searchParams.get("date") || "") || currentGameDate(env.MLB_TZ || "America/New_York");
+      const result = await ensureChannelMenu(env, targetDate, true);
+      return jsonResponse({ ok: true, result });
     }
 
     if (path === "/set-webhook" || path === "/api/set-webhook") {
@@ -389,6 +399,21 @@ async function handleUpdate(env, update) {
 
 async function handleCallbackQuery(env, callbackQuery) {
   const data = String(callbackQuery.data || "");
+  if (data.startsWith("menu_date:")) {
+    const gameDate = data.split(":", 2)[1] || currentGameDate(env.MLB_TZ || "America/New_York");
+    const chatId = callbackQuery.message?.chat?.id;
+    const messageId = callbackQuery.message?.message_id;
+    if (!chatId || !messageId) {
+      await answerCallbackQuery(env, callbackQuery.id, "Не вижу сообщение меню.");
+      return;
+    }
+    const menu = await buildChannelMenu(env, gameDate);
+    await editMessage(env, chatId, messageId, menu.text, menu.options);
+    await saveChannelMenu(env, chatId, messageId, menu.text, gameDate);
+    await answerCallbackQuery(env, callbackQuery.id, `Дата: ${ruDate(gameDate)}`);
+    return;
+  }
+
   if (!data.startsWith("edit_names:")) {
     await answerCallbackQuery(env, callbackQuery.id, "Команда не распознана.");
     return;
@@ -436,6 +461,10 @@ async function handleCommand(env, raw) {
   if (cmd === "/schedule") {
     const d = parseOptionalDate(rest) || currentDate;
     return buildSchedule(env, d);
+  }
+  if (cmd === "/menu") {
+    const d = parseOptionalDate(rest) || currentDate;
+    return ensureChannelMenu(env, d, true);
   }
   if (cmd === "/status") {
     const d = parseOptionalDate(rest) || currentDate;
@@ -520,6 +549,85 @@ async function cronCheckOnce(env) {
   return results;
 }
 
+async function ensureChannelMenu(env, selectedDate = null, force = false) {
+  const gameDate = selectedDate || currentGameDate(env.MLB_TZ || "America/New_York");
+  const menu = await buildChannelMenu(env, gameDate);
+  const existing = await getChannelMenu(env);
+  const chatId = env.TARGET_CHAT_ID || "-1003643946438";
+
+  if (existing?.message_id && existing?.chat_id) {
+    if (!force && existing.text === menu.text && existing.selected_date === gameDate) {
+      return `Меню уже актуально: ${gameDate}.`;
+    }
+    try {
+      await editMessage(env, existing.chat_id, existing.message_id, menu.text, menu.options);
+      await saveChannelMenu(env, existing.chat_id, existing.message_id, menu.text, gameDate);
+      return `Обновил меню канала: ${gameDate}.`;
+    } catch (error) {
+      console.log(`menu edit failed, sending a new one: ${String(error?.message || error)}`);
+    }
+  }
+
+  const messageId = await sendMessage(env, chatId, menu.text, menu.options);
+  await saveChannelMenu(env, chatId, messageId, menu.text, gameDate);
+  return `Опубликовал меню канала: ${gameDate}.`;
+}
+
+async function buildChannelMenu(env, selectedDate) {
+  const d = selectedDate || currentGameDate(env.MLB_TZ || "America/New_York");
+  const games = await gamesForDate(d);
+  const posted = Boolean(await getPost(env, d));
+  const summary = summarizeGames(games);
+  const word = pluralRu(summary.total, "матч", "матча", "матчей");
+  const lines = [
+    `⚾️ <b>МЛБ • Меню</b>`,
+    "",
+    `📅 <b>${escapeHtml(ruDate(d))}</b>`,
+    `Всего: ${summary.total} ${word}`,
+    `Сыграно: ${summary.final}`,
+    `Идёт сейчас: ${summary.live}`,
+    `Ожидают: ${summary.pending}`,
+    `Опубликовано: ${posted ? "да" : "нет"}`,
+  ];
+
+  if (games.length) {
+    lines.push("", "Расписание:");
+    const translator = createTranslator(env);
+    for (const game of games.slice().sort(gameSortKey)) {
+      const home = await translator.team(game.teams?.home?.team || {});
+      const away = await translator.team(game.teams?.away?.team || {});
+      const status = statusRu(game) || gameLocalTime(env, game);
+      const score = isFinalGame(game) || isActiveGame(game)
+        ? ` ${intOrZero(game.teams?.away?.score)}:${intOrZero(game.teams?.home?.score)}`
+        : "";
+      lines.push(`${escapeHtml(away)} — ${escapeHtml(home)}${score} • ${escapeHtml(status)}`);
+    }
+  }
+
+  return {
+    text: lines.join("\n").trim(),
+    options: {
+      parse_mode: "HTML",
+      reply_markup: menuMarkup(env, d),
+    },
+  };
+}
+
+function menuMarkup(env, selectedDate) {
+  const today = currentGameDate(env.MLB_TZ || "America/New_York");
+  const rows = [];
+  const dateButtons = [];
+  for (let delta = 0; delta < 5; delta += 1) {
+    const d = addDays(today, -delta);
+    const label = d === selectedDate ? `• ${shortDate(d)} •` : shortDate(d);
+    dateButtons.push({ text: label, callback_data: `menu_date:${d}` });
+  }
+  rows.push(dateButtons.slice(0, 3));
+  rows.push(dateButtons.slice(3));
+  rows.push([{ text: "✏️ Править фамилии", callback_data: `edit_names:${selectedDate}` }]);
+  return { inline_keyboard: rows };
+}
+
 async function checkSingleDate(env, d) {
   if (await getPost(env, d)) return `${d}: already posted`;
   const games = await gamesForDate(d);
@@ -528,7 +636,9 @@ async function checkSingleDate(env, d) {
     return `${d}: not ready (${final}/${games.length} final)`;
   }
   const text = await buildResults(env, d, false, games);
-  return sendOrEditChannelPost(env, d, text);
+  const result = await sendOrEditChannelPost(env, d, text);
+  await ensureChannelMenu(env, d, true);
+  return result;
 }
 
 async function sendOrEditChannelPost(env, d, text) {
@@ -593,20 +703,25 @@ async function buildSchedule(env, d) {
 
 async function statusSummary(env, d, posted) {
   const games = await gamesForDate(d);
-  const total = games.length;
-  const final = games.filter(isFinalGame).length;
-  const active = games.filter(isActiveGame).length;
-  const pending = Math.max(0, total - final - active);
+  const { total, final, live, pending } = summarizeGames(games);
   const ready = total > 0 && final === total;
   return [
     `MLB ${d}`,
     `Всего: ${total}`,
     `Завершено: ${final}`,
-    `В игре: ${active}`,
+    `В игре: ${live}`,
     `Ожидают: ${pending}`,
     `Готово к публикации: ${ready ? "да" : "нет"}`,
     `Опубликовано: ${posted ? "да" : "нет"}`,
   ].join("\n");
+}
+
+function summarizeGames(games) {
+  const total = games.length;
+  const final = games.filter(isFinalGame).length;
+  const live = games.filter(isActiveGame).length;
+  const pending = Math.max(0, total - final - live);
+  return { total, final, live, pending };
 }
 
 async function unknownPlayers(env, d) {
@@ -897,6 +1012,23 @@ async function savePost(env, d, chatId, messageId, text) {
   await env.MLB_STATE.put("latest_post_date", d);
 }
 
+async function saveChannelMenu(env, chatId, messageId, text, selectedDate) {
+  await env.MLB_STATE.put(
+    "channel_menu",
+    JSON.stringify({
+      chat_id: String(chatId),
+      message_id: Number(messageId),
+      text,
+      selected_date: selectedDate,
+      updated_at: new Date().toISOString(),
+    }),
+  );
+}
+
+async function getChannelMenu(env) {
+  return kvGetJson(env, "channel_menu");
+}
+
 async function getPost(env, d) {
   return kvGetJson(env, `post:${d}`);
 }
@@ -978,13 +1110,18 @@ async function sendMessage(env, chatId, text, extra = {}) {
 }
 
 async function editMessage(env, chatId, messageId, text, extra = {}) {
-  await telegramRequest(env, "editMessageText", {
-    chat_id: chatId,
-    message_id: Number(messageId),
-    text,
-    disable_web_page_preview: true,
-    ...extra,
-  });
+  try {
+    await telegramRequest(env, "editMessageText", {
+      chat_id: chatId,
+      message_id: Number(messageId),
+      text,
+      disable_web_page_preview: true,
+      ...extra,
+    });
+  } catch (error) {
+    if (String(error?.message || error).includes("message is not modified")) return;
+    throw error;
+  }
 }
 
 async function fetchJson(url) {
@@ -1102,6 +1239,11 @@ function addDays(ymd, days) {
 function ruDate(ymd) {
   const [, month, day] = ymd.split("-").map(Number);
   return `${day} ${MONTHS_RU[month]}`;
+}
+
+function shortDate(ymd) {
+  const [, month, day] = ymd.split("-").map(Number);
+  return `${day}.${pad2(month)}`;
 }
 
 function parseOptionalDate(value) {
