@@ -246,6 +246,10 @@ const DEFAULT_TEAM_MAP = new Map([
   ...Object.entries(TEAM_RU_BY_NAME).map(([k, v]) => [normKey(k), v]),
 ]);
 
+const TRANSLATIONS_INDEX_KEY = "translations_index:v1";
+const TRANSLATIONS_INDEX_CACHE_TTL_MS = 60 * 1000;
+let translationsIndexCache = { expiresAt: 0, rows: null };
+
 const POSITION_RU = {
   P: "питчер",
   C: "кэтчер",
@@ -268,7 +272,7 @@ export default {
   async scheduled(_controller, env, _ctx) {
     if (!isTrue(env.AUTO_POST, true)) return;
     const results = await cronCheckOnce(env);
-    const menu = await ensureChannelMenu(env);
+    const menu = shouldRunScheduledMenu(env) ? await ensureChannelMenu(env) : "menu skipped by interval";
     console.log(JSON.stringify({ results }));
     console.log(JSON.stringify({ menu }));
   },
@@ -298,6 +302,7 @@ async function route(request, env) {
         callback_query: true,
         target_chat_id: env.TARGET_CHAT_ID || "-1003643946438",
         auto_post: isTrue(env.AUTO_POST, true),
+        menu_update_minutes: numberOrDefault(env.MENU_UPDATE_MINUTES, 15),
       });
     }
 
@@ -605,20 +610,30 @@ async function cronCheckOnce(env) {
 
   for (let delta = 0; delta < lookback; delta += 1) {
     const d = addDays(today, -delta);
-    if (isTargetPost(env, await getPost(env, d))) {
+    const existing = await getPost(env, d);
+    if (isTargetPost(env, existing)) {
       results.push(`${d}: already posted`);
       continue;
     }
-    results.push(await checkSingleDate(env, d));
+    results.push(await checkSingleDate(env, d, existing));
   }
   return results;
 }
 
 async function ensureChannelMenu(env, selectedDate = null, force = false) {
   const gameDate = selectedDate || currentGameDate(env.MLB_TZ || "America/New_York");
-  const menu = await buildChannelMenu(env, gameDate);
   const existing = await getChannelMenu(env);
   const chatId = env.TARGET_CHAT_ID || "-1003643946438";
+
+  if (!force && existing?.message_id && existing?.chat_id && existing.selected_date === gameDate) {
+    const minAgeMs = menuUpdateIntervalMs(env);
+    const updatedAt = Date.parse(existing.updated_at || "");
+    if (Number.isFinite(updatedAt) && Date.now() - updatedAt < minAgeMs) {
+      return `Меню обновлялось недавно: ${gameDate}.`;
+    }
+  }
+
+  const menu = await buildChannelMenu(env, gameDate);
 
   if (existing?.message_id && existing?.chat_id) {
     if (!force && existing.text === menu.text && existing.selected_date === gameDate) {
@@ -636,6 +651,15 @@ async function ensureChannelMenu(env, selectedDate = null, force = false) {
   const messageId = await sendMessage(env, chatId, menu.text, menu.options);
   await saveChannelMenu(env, chatId, messageId, menu.text, gameDate);
   return `Опубликовал меню канала: ${gameDate}.`;
+}
+
+function menuUpdateIntervalMs(env) {
+  return Math.max(1, numberOrDefault(env.MENU_UPDATE_MINUTES, 15)) * 60 * 1000;
+}
+
+function shouldRunScheduledMenu(env, now = new Date()) {
+  const minutes = Math.max(1, Math.round(numberOrDefault(env.MENU_UPDATE_MINUTES, 15)));
+  return now.getUTCMinutes() % minutes === 0;
 }
 
 async function buildChannelMenu(env, selectedDate) {
@@ -693,8 +717,8 @@ function menuMarkup(env, selectedDate) {
   return { inline_keyboard: rows };
 }
 
-async function checkSingleDate(env, d) {
-  const existing = await getPost(env, d);
+async function checkSingleDate(env, d, knownPost = undefined) {
+  const existing = knownPost === undefined ? await getPost(env, d) : knownPost;
   if (existing && isTargetPost(env, existing)) return `${d}: already posted`;
   const games = await gamesForDate(d);
   if (!allDone(games)) {
@@ -851,34 +875,33 @@ async function putPlayerTranslation(env, player, target) {
     position: positionLabel(player),
     updated_at: now,
   };
+  const payloads = [base];
 
   if (playerId) {
-    await env.MLB_STATE.put(
-      translationKey("player_id", String(playerId)),
-      JSON.stringify({ ...base, kind: "player_id", source: String(playerId), source_norm: normKey(String(playerId)) }),
-    );
+    payloads.push({ ...base, kind: "player_id", source: String(playerId), source_norm: normKey(String(playerId)) });
   }
 
-  await env.MLB_STATE.put(translationKey("player", source), JSON.stringify(base));
   const clean = cleanPlayerSource(source);
   if (clean && normKey(clean) !== normKey(source)) {
-    await env.MLB_STATE.put(translationKey("player", clean), JSON.stringify({ ...base, source: clean, source_norm: normKey(clean) }));
+    payloads.push({ ...base, source: clean, source_norm: normKey(clean) });
   }
 
   const lastName = playerLastName(source);
   if (lastName && normKey(lastName) !== normKey(source) && isSingleWord(rawTarget)) {
-    await env.MLB_STATE.put(
-      translationKey("player", lastName),
-      JSON.stringify({
-        ...base,
-        kind: "player",
-        source: lastName,
-        source_norm: normKey(lastName),
-        target: rawTarget,
-        scope: "last_name",
-      }),
-    );
+    payloads.push({
+      ...base,
+      kind: "player",
+      source: lastName,
+      source_norm: normKey(lastName),
+      target: rawTarget,
+      scope: "last_name",
+    });
   }
+
+  for (const payload of payloads) {
+    await env.MLB_STATE.put(translationKey(payload.kind, payload.source), JSON.stringify(payload));
+  }
+  await upsertTranslationIndex(env, payloads);
 
   return { source, target: normalizedTarget };
 }
@@ -1258,9 +1281,10 @@ function createTranslator(env) {
 }
 
 async function getTranslation(env, kind, source) {
+  const index = await loadTranslationsIndex(env);
   const kinds = kind === "any" ? [kind] : [kind, "any"];
   for (const k of kinds) {
-    const row = await kvGetJson(env, translationKey(k, source));
+    const row = index[translationIndexKey(k, source)];
     if (row?.target) return row.target;
   }
   return null;
@@ -1275,6 +1299,55 @@ async function putTranslation(env, kind, source, target) {
     updated_at: new Date().toISOString(),
   };
   await env.MLB_STATE.put(translationKey(kind, source), JSON.stringify(payload));
+  await upsertTranslationIndex(env, payload);
+}
+
+async function loadTranslationsIndex(env) {
+  const now = Date.now();
+  if (translationsIndexCache.rows && translationsIndexCache.expiresAt > now) {
+    return translationsIndexCache.rows;
+  }
+
+  const stored = await kvGetJson(env, TRANSLATIONS_INDEX_KEY);
+  if (stored?.rows && typeof stored.rows === "object") {
+    translationsIndexCache = { rows: stored.rows, expiresAt: now + TRANSLATIONS_INDEX_CACHE_TTL_MS };
+    return stored.rows;
+  }
+
+  const rows = {};
+  const list = await env.MLB_STATE.list({ prefix: "translation:", limit: 1000 });
+  for (const item of list.keys) {
+    const row = await kvGetJson(env, item.name);
+    if (!row?.kind || !row?.source_norm || !row?.target) continue;
+    rows[translationIndexKey(row.kind, row.source_norm)] = row;
+  }
+  await saveTranslationsIndex(env, rows);
+  return rows;
+}
+
+async function upsertTranslationIndex(env, payloadOrPayloads) {
+  const rows = await loadTranslationsIndex(env);
+  for (const row of Array.isArray(payloadOrPayloads) ? payloadOrPayloads : [payloadOrPayloads]) {
+    if (!row?.kind || !row?.source_norm || !row?.target) continue;
+    rows[translationIndexKey(row.kind, row.source_norm)] = row;
+  }
+  await saveTranslationsIndex(env, rows);
+}
+
+async function saveTranslationsIndex(env, rows) {
+  translationsIndexCache = { rows, expiresAt: Date.now() + TRANSLATIONS_INDEX_CACHE_TTL_MS };
+  await env.MLB_STATE.put(
+    TRANSLATIONS_INDEX_KEY,
+    JSON.stringify({
+      version: 1,
+      updated_at: new Date().toISOString(),
+      rows,
+    }),
+  );
+}
+
+function translationIndexKey(kind, source) {
+  return `${kind}:${normKey(source)}`;
 }
 
 async function listTranslations(env, query = "", limit = 30) {
